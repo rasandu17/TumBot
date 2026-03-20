@@ -20,8 +20,27 @@ import os
 import base64
 import subprocess
 import sys
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "cookies.txt")
+PORT = int(os.getenv("PORT", "8000"))
+
+# ── Health check server (keeps Koyeb happy) ──────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, *args):
+        pass  # silence health check logs
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+threading.Thread(target=start_health_server, daemon=True).start()
+print(f"[start.py] 💓 Health check server running on port {PORT}")
 
 # ── Strategy A: chunked vars ─────────────────────────────────────────────────
 chunks = []

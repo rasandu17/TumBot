@@ -18,4 +18,5 @@ tmp/
 *.png
 *.webp
 cookies.txt
+cookies_b64.txt
 instagram_cookies.txt

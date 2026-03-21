@@ -1,10 +1,12 @@
 """
 downloader.py — Instagram media downloader using yt-dlp
+Supports both video (reels/IGTV) and photo posts.
 """
 
 import os
 import glob
 import logging
+import requests
 from pathlib import Path
 
 import yt_dlp
@@ -21,9 +23,30 @@ logger = logging.getLogger("TumblerBot.downloader")
 # Instagram cookies file (optional — improves success rate for private/login-walled content)
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "")  # path to a Netscape cookies.txt
 
+_HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _cookie_opts() -> dict:
+    """Return cookie-related yt-dlp options."""
+    opts: dict = {}
+    if COOKIES_FILE and Path(COOKIES_FILE).is_file():
+        opts["cookiefile"] = COOKIES_FILE
+        logger.info("Using cookies file: %s", COOKIES_FILE)
+    browser = os.getenv("INSTAGRAM_BROWSER", "").lower().strip()
+    if browser:
+        opts["cookiesfrombrowser"] = (browser,)
+        logger.info("Using cookies from browser: %s", browser)
+    return opts
+
 
 def _ydl_opts(output_dir: str) -> dict:
-    """Build yt-dlp options for Instagram downloads."""
+    """Build yt-dlp options for Instagram video downloads."""
     outtmpl = os.path.join(output_dir, "%(id)s.%(ext)s")
 
     opts: dict = {
@@ -32,14 +55,8 @@ def _ydl_opts(output_dir: str) -> dict:
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": False,
-        "writeinfojson": True,          # we parse this for the caption
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        },
+        "writeinfojson": True,
+        "http_headers": _HTTP_HEADERS,
         "socket_timeout": 60,
         "retries": 5,
         "postprocessors": [
@@ -54,22 +71,35 @@ def _ydl_opts(output_dir: str) -> dict:
         opts["ffmpeg_location"] = _FFMPEG_PATH
         logger.info("Using bundled ffmpeg: %s", _FFMPEG_PATH)
 
-    if COOKIES_FILE and Path(COOKIES_FILE).is_file():
-        opts["cookiefile"] = COOKIES_FILE
-        logger.info("Using cookies file: %s", COOKIES_FILE)
-    
-    # Read cookies directly from a specific browser (e.g., "chrome", "edge", "firefox")
-    browser = os.getenv("INSTAGRAM_BROWSER", "").lower().strip()
-    if browser:
-        opts["cookiesfrombrowser"] = (browser, )
-        logger.info("Using cookies from browser: %s", browser)
-
+    opts.update(_cookie_opts())
     return opts
+
+
+def _download_image(url: str, output_dir: str, filename: str) -> str:
+    """Download a single image URL to output_dir and return the path."""
+    resp = requests.get(url, headers=_HTTP_HEADERS, timeout=60)
+    resp.raise_for_status()
+
+    # Determine extension from content type or URL
+    content_type = resp.headers.get("Content-Type", "")
+    if "png" in content_type:
+        ext = ".png"
+    elif "webp" in content_type:
+        ext = ".webp"
+    else:
+        ext = ".jpg"
+
+    filepath = os.path.join(output_dir, filename + ext)
+    with open(filepath, "wb") as f:
+        f.write(resp.content)
+    logger.info("Downloaded image: %s (%d bytes)", filepath, len(resp.content))
+    return filepath
 
 
 def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
     """
     Download an Instagram post/reel using yt-dlp.
+    Falls back to direct image download for photo posts.
 
     Returns
     -------
@@ -80,22 +110,82 @@ def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
     """
     opts = _ydl_opts(output_dir)
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
 
-    # ── Resolve the downloaded file ────────────────────────────────────────
-    # yt-dlp may merge streams, so scan for the real file
-    media_path = _find_media_file(output_dir)
-    if not media_path:
-        raise FileNotFoundError("yt-dlp did not produce a media file in: " + output_dir)
+        # ── Resolve the downloaded file ────────────────────────────────────
+        media_path = _find_media_file(output_dir)
+        if not media_path:
+            raise FileNotFoundError("yt-dlp did not produce a media file in: " + output_dir)
 
-    ext = Path(media_path).suffix.lower()
-    media_type = "video" if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi"} else "image"
+        ext = Path(media_path).suffix.lower()
+        media_type = "video" if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi"} else "image"
+        caption = _extract_caption(info)
 
-    caption = _extract_caption(info)
+    except yt_dlp.utils.DownloadError as e:
+        if "No video formats found" not in str(e):
+            raise  # Re-raise if it's a different error
+
+        # ── Photo post fallback ────────────────────────────────────────────
+        logger.info("No video found — trying photo download for: %s", url)
+        info = _extract_info_only(url)
+        caption = _extract_caption(info)
+
+        # Get the best thumbnail/image URL from the info dict
+        image_url = _get_best_image_url(info)
+        if not image_url:
+            raise FileNotFoundError(
+                "Could not find an image URL for this post. "
+                "Make sure the post is public."
+            ) from e
+
+        post_id = info.get("id", "photo")
+        media_path = _download_image(image_url, output_dir, post_id)
+        media_type = "image"
+
     logger.info("Downloaded %s (%s) — caption length: %d", media_path, media_type, len(caption))
-
     return media_path, media_type, caption
+
+
+def _extract_info_only(url: str) -> dict:
+    """Extract metadata without downloading (for photo fallback)."""
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "writeinfojson": False,
+        "http_headers": _HTTP_HEADERS,
+        "socket_timeout": 60,
+        "extract_flat": False,
+    }
+    opts.update(_cookie_opts())
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False) or {}
+    except Exception:
+        return {}
+
+
+def _get_best_image_url(info: dict) -> str | None:
+    """Extract the best image URL from yt-dlp info dict."""
+    if not info:
+        return None
+
+    # Check thumbnails list (usually has the full-res image)
+    thumbnails = info.get("thumbnails", [])
+    if thumbnails:
+        # Sort by resolution (prefer largest)
+        best = max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0))
+        if best.get("url"):
+            return best["url"]
+
+    # Fallback: direct thumbnail field
+    if info.get("thumbnail"):
+        return info["thumbnail"]
+
+    return None
 
 
 def _find_media_file(directory: str) -> str | None:

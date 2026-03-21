@@ -130,63 +130,68 @@ def download_instagram(url: str, output_dir: str) -> tuple[str | list[str], str,
         if isinstance(e, yt_dlp.utils.DownloadError) and "No video formats found" not in str(e):
             raise  # Re-raise if it's a different error
 
-        # ── Photo post fallback using Instaloader ──────────────────────────
-        logger.info("No video found — trying photo download with instaloader for: %s", url)
+        # ── Photo post fallback using gallery-dl ───────────────────────────
+        logger.info("No video found — trying photo download with gallery-dl for: %s", url)
         
         try:
-            return _download_with_instaloader(url, output_dir)
-        except Exception as instaloader_e:
+            return _download_with_gallery_dl(url, output_dir)
+        except Exception as fallback_e:
+            logger.exception("gallery-dl photo fallback failed")
             raise FileNotFoundError(
-                f"Could not download this photo post: {instaloader_e}\n"
+                f"Could not download this photo post: {fallback_e}\n"
                 "Make sure the post is public and the URL is correct."
             ) from e
 
 
-def _download_with_instaloader(url: str, output_dir: str) -> tuple[str | list[str], str, str]:
-    """Fallback photo downloader using instaloader. Supports multiple photos (carousels)."""
-    import instaloader
-    import re
+def _download_with_gallery_dl(url: str, output_dir: str) -> tuple[str | list[str], str, str]:
+    """Fallback photo downloader using gallery-dl. Supports multiple photos (carousels)."""
+    import subprocess
+    import json
+    import glob
 
-    L = instaloader.Instaloader()
-    
-    # Load cookies if available
+    cmd = [
+        "python", "-m", "gallery_dl",
+        "--directory", output_dir,
+        "--write-metadata"
+    ]
     if COOKIES_FILE and Path(COOKIES_FILE).is_file():
+        cmd.extend(["--cookies", COOKIES_FILE])
+    
+    cmd.append(url)
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"gallery-dl failed (code {res.returncode}): {res.stderr or res.stdout}")
+
+    # Find the downloaded files (images + json)
+    # output_dir might have subdirectories created by gallery-dl, e.g. instagram/<username>/<file>
+    json_files = glob.glob(os.path.join(output_dir, "**", "*.json"), recursive=True)
+    image_paths = []
+    caption = ""
+
+    # Parse metadata for caption
+    for j_file in json_files:
         try:
-            # instaloader prefers its own session format, but can import Netscape cookies
-            # However, for public posts it shouldn't be strictly necessary 
-            pass
-        except Exception:
-            pass
+            with open(j_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # the description field often has the caption!
+                if data.get("description") and not caption:
+                    caption = data["description"]
+        except Exception as e:
+            logger.warning("Failed to parse gallery-dl json: %s", e)
 
-    # Extract shortcode
-    match = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
-    if not match:
-        raise ValueError("Could not extract shortcode from URL")
-    shortcode = match.group(1)
+    # Find all downloaded images
+    for root, _, sorted_files in os.walk(output_dir):
+        for f in sorted(sorted_files):
+            ext = Path(f).suffix.lower()
+            if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+                image_paths.append(os.path.join(root, f))
 
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    caption = post.caption or ""
+    if not image_paths:
+        raise ValueError("No images found by gallery-dl (could be a private post or video).")
 
-    image_urls = []
-    if post.typename == 'GraphSidecar':
-        for node in post.get_sidecar_nodes():
-            if not node.is_video:
-                image_urls.append(node.display_url)
-    elif not post.is_video:
-        image_urls.append(post.url)
-
-    if not image_urls:
-         raise ValueError("No images found in this post (it might be a video that yt-dlp failed to download).")
-
-    downloaded_paths = []
-    for idx, img_url in enumerate(image_urls):
-        filename = f"{shortcode}_{idx}" if len(image_urls) > 1 else shortcode
-        path = _download_image(img_url, output_dir, filename)
-        downloaded_paths.append(path)
-
-    # Return single string if only 1 photo, else list
-    final_path = downloaded_paths[0] if len(downloaded_paths) == 1 else downloaded_paths
-    logger.info("Instaloader downloaded %d image(s)", len(downloaded_paths))
+    final_path = image_paths[0] if len(image_paths) == 1 else image_paths
+    logger.info("gallery-dl downloaded %d image(s)", len(image_paths))
     
     return final_path, "image", caption
 

@@ -111,6 +111,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "tmp_dir": tmp_dir
             }
             
+            from telegram import InputMediaPhoto
+            await status_msg.edit_text("🖼️ Sending photo previews, please wait...")
+            
+            try:
+                # Telegram allows max 10 photos per media group
+                m_list = list(media_path)
+                media_batches = [m_list[i : i + 10] for i in range(0, len(m_list), 10)]
+                offset = 0
+                for batch in media_batches:
+                    media_group = []
+                    for i, p in enumerate(batch):
+                        num = offset + i + 1
+                        with open(str(p), 'rb') as f:
+                            # Read file fully to memory to avoid open file handles blocking deletion
+                            media_group.append(InputMediaPhoto(f.read(), caption=f"Photo {num}"))
+                    await update.message.reply_media_group(media=media_group)
+                    offset += len(batch)
+            except Exception as tg_err:
+                logger.warning("Could not send media group preview: %s", tg_err)
+
             keyboard = []
             row = []
             for i in range(len(media_path)):
@@ -125,7 +145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             await status_msg.edit_text(
                 f"📸 This post contains {len(media_path)} photos.\n\n"
-                "Which one would you like to upload to Tumblr?",
+                "Please view the photo previews sent above and select which one to upload to Tumblr:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return

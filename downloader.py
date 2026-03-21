@@ -153,8 +153,8 @@ def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
 
 def _scrape_instagram_image(url: str) -> tuple[str | None, str]:
     """
-    Scrape an Instagram post page to extract the image URL and caption.
-    Uses og:image meta tag which works for public posts.
+    Get the image URL and caption for an Instagram photo post.
+    Tries multiple methods in order of reliability.
     Returns (image_url, caption) or (None, "") on failure.
     """
     import re
@@ -166,57 +166,65 @@ def _scrape_instagram_image(url: str) -> tuple[str | None, str]:
     if not url.startswith("http"):
         url = "https://" + url
 
-    # ── Method 1: Scrape the page for og:image ────────────────────────────
+    # ── Method 1: Instagram oEmbed API (public, no auth needed) ───────────
     try:
-        # Try with cookies if available
+        oembed_url = f"https://api.instagram.com/oembed/?url={url}"
+        resp = requests.get(oembed_url, headers=_HTTP_HEADERS, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            image_url = data.get("thumbnail_url")
+            caption = data.get("title", "")
+            if image_url:
+                logger.info("Got image from oEmbed API: %s", image_url[:100])
+                return image_url, caption
+    except Exception as e:
+        logger.warning("oEmbed API failed: %s", e)
+
+    # ── Method 2: Scrape the page for og:image ────────────────────────────
+    try:
         session = requests.Session()
         session.headers.update(_HTTP_HEADERS)
 
         if COOKIES_FILE and Path(COOKIES_FILE).is_file():
-            # Load Netscape cookies into the session
             from http.cookiejar import MozillaCookieJar
             cj = MozillaCookieJar(COOKIES_FILE)
             try:
                 cj.load(ignore_discard=True, ignore_expires=True)
                 session.cookies.update(cj)
-            except Exception as cookie_err:
-                logger.warning("Could not load cookies: %s", cookie_err)
+            except Exception:
+                pass
 
         resp = session.get(url, timeout=30, allow_redirects=True)
         html = resp.text
 
-        # Extract og:image
+        # Extract og:image (try both attribute orders)
         og_match = re.search(
-            r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+            r'<meta\s+[^>]*?content=["\']([^"\']+)["\'][^>]*?property=["\']og:image["\']',
+            html
+        ) or re.search(
+            r'<meta\s+[^>]*?property=["\']og:image["\'][^>]*?content=["\']([^"\']+)["\']',
             html
         )
-        if not og_match:
-            og_match = re.search(
-                r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
-                html
-            )
 
         if og_match:
             image_url = og_match.group(1).replace("&amp;", "&")
             logger.info("Found og:image: %s", image_url[:100])
 
-        # Extract og:description for caption
+        # Extract caption from og:description
         desc_match = re.search(
-            r'<meta\s+(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']*)["\']',
+            r'<meta\s+[^>]*?content=["\']([^"\']*)["\'][^>]*?property=["\']og:description["\']',
+            html
+        ) or re.search(
+            r'<meta\s+[^>]*?property=["\']og:description["\'][^>]*?content=["\']([^"\']*)["\']',
             html
         )
-        if not desc_match:
-            desc_match = re.search(
-                r'content=["\']([^"\']*)["\']\\s+(?:property|name)=["\']og:description["\']',
-                html
-            )
-        if desc_match:
+        if desc_match and not caption:
             caption = desc_match.group(1).replace("&amp;", "&").replace("&#39;", "'")
 
     except Exception as e:
         logger.warning("Page scrape failed: %s", e)
 
-    # ── Method 2: Try yt-dlp metadata extraction as fallback ──────────────
+    # ── Method 3: Try yt-dlp metadata extraction ──────────────────────────
     if not image_url:
         try:
             opts: dict = {
@@ -232,7 +240,6 @@ def _scrape_instagram_image(url: str) -> tuple[str | None, str]:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False) or {}
 
-            # Check thumbnails
             thumbnails = info.get("thumbnails", [])
             if thumbnails:
                 best = max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0))

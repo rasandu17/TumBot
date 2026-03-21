@@ -10,19 +10,25 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
 from downloader import download_instagram
 from uploader import upload_to_tumblr
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Temporary storage for multi-photo selection (in-memory)
+pending_uploads = {}
+import uuid
+
+# Parse environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -85,12 +91,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Work inside a temp directory so we clean up automatically
     tmp_dir = tempfile.mkdtemp(prefix="tumblerbot_")
+    cleanup_needed = True
     try:
         # ── Download ──────────────────────────────────────────────────────
         logger.info("Downloading: %s", url)
         media_path, media_type, caption = await asyncio.to_thread(
             download_instagram, url, tmp_dir
         )
+
+        # ── Multi-Media Selection ─────────────────────────────────────────
+        if isinstance(media_path, list) and len(media_path) > 1:
+            cleanup_needed = False
+            upload_id = str(uuid.uuid4())[:12]  # short ID to fit in callback_data
+            pending_uploads[upload_id] = {
+                "media_path": media_path,
+                "media_type": media_type,
+                "caption": caption,
+                "url": url,
+                "tmp_dir": tmp_dir
+            }
+            
+            keyboard = []
+            row = []
+            for i in range(len(media_path)):
+                row.append(InlineKeyboardButton(f"Photo {i+1}", callback_data=f"up_{upload_id}_{i}"))
+                if len(row) == 3:  # 3 buttons per row
+                    keyboard.append(row)
+                    row = []
+            if row:
+                keyboard.append(row)
+            
+            keyboard.append([InlineKeyboardButton("Upload All (Carousel)", callback_data=f"up_{upload_id}_all")])
+            
+            await status_msg.edit_text(
+                f"📸 This post contains {len(media_path)} photos.\n\n"
+                "Which one would you like to upload to Tumblr?",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
 
         await status_msg.edit_text(
             f"✅ Downloaded!  Uploading to Tumblr… 📤",
@@ -105,6 +143,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await status_msg.edit_text(
             f"🎉 *Successfully posted to Tumblr!*\n\n🔗 {post_url}",
             parse_mode="Markdown",
+            disable_web_page_preview=True
         )
 
     except Exception as exc:
@@ -113,7 +152,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"❌ Error: {exc}\n\nMake sure the post is public and the URL is correct."
         )
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if cleanup_needed:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    if not data.startswith("up_"):
+        return
+        
+    parts = data.split("_")
+    upload_id = parts[1]
+    selection = parts[2]
+    
+    if upload_id not in pending_uploads:
+        await query.edit_message_text("❌ This upload session has expired. Please send the link again.")
+        return
+        
+    session = pending_uploads[upload_id]
+    
+    await query.edit_message_text("✅ Processing selection! Uploading to Tumblr… 📤")
+    
+    try:
+        paths = session["media_path"]
+        if selection == "all":
+            selected_path = paths
+        else:
+            selected_path = list(paths)[int(selection)]
+            
+        post_url = await asyncio.to_thread(
+            upload_to_tumblr, selected_path, str(session["media_type"]), str(session["caption"]), str(session["url"])
+        )
+
+        await query.edit_message_text(
+            f"🎉 *Successfully posted to Tumblr!*\n\n🔗 {post_url}",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+    except Exception as exc:
+        logger.exception("Callback Pipeline failed")
+        await query.edit_message_text(f"❌ Error during upload: {exc}")
+    finally:
+        pending_uploads.pop(upload_id, None)
+        shutil.rmtree(str(session["tmp_dir"]), ignore_errors=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -127,6 +210,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("TumblerBot is running — waiting for messages…")
     app.run_polling(drop_pending_updates=True)

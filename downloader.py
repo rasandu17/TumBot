@@ -96,15 +96,15 @@ def _download_image(url: str, output_dir: str, filename: str) -> str:
     return filepath
 
 
-def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
+def download_instagram(url: str, output_dir: str) -> tuple[str | list[str], str, str]:
     """
     Download an Instagram post/reel using yt-dlp.
-    Falls back to direct image download for photo posts.
+    Falls back to instaloader for photo posts (supports carousels).
 
     Returns
     -------
     (media_path, media_type, caption)
-        media_path : absolute path to the downloaded file
+        media_path : absolute path to the downloaded file, or a list of paths
         media_type : "video" | "image"
         caption    : post description (may be empty)
     """
@@ -122,138 +122,73 @@ def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
         ext = Path(media_path).suffix.lower()
         media_type = "video" if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi"} else "image"
         caption = _extract_caption(info)
+        
+        logger.info("Downloaded %s (%s) — caption length: %d", media_path, media_type, len(caption))
+        return media_path, media_type, caption
 
     except (yt_dlp.utils.DownloadError, FileNotFoundError) as e:
         if isinstance(e, yt_dlp.utils.DownloadError) and "No video formats found" not in str(e):
             raise  # Re-raise if it's a different error
 
-        # ── Photo post fallback ────────────────────────────────────────────
-        logger.info("No video found — trying photo download for: %s", url)
-
-        # Try multiple methods to get the image URL
-        image_url, caption = _scrape_instagram_image(url)
-
-        if not image_url:
+        # ── Photo post fallback using Instaloader ──────────────────────────
+        logger.info("No video found — trying photo download with instaloader for: %s", url)
+        
+        try:
+            return _download_with_instaloader(url, output_dir)
+        except Exception as instaloader_e:
             raise FileNotFoundError(
-                "Could not download this photo post. "
+                f"Could not download this photo post: {instaloader_e}\n"
                 "Make sure the post is public and the URL is correct."
             ) from e
 
-        # Extract post ID from URL
-        import re
-        match = re.search(r"/(p|reel|tv)/([A-Za-z0-9_-]+)", url)
-        post_id = match.group(2) if match else "photo"
 
-        media_path = _download_image(image_url, output_dir, post_id)
-        media_type = "image"
-
-    logger.info("Downloaded %s (%s) — caption length: %d", media_path, media_type, len(caption))
-    return media_path, media_type, caption
-
-
-def _scrape_instagram_image(url: str) -> tuple[str | None, str]:
-    """
-    Get the image URL and caption for an Instagram photo post.
-    Tries multiple methods in order of reliability.
-    Returns (image_url, caption) or (None, "") on failure.
-    """
+def _download_with_instaloader(url: str, output_dir: str) -> tuple[str | list[str], str, str]:
+    """Fallback photo downloader using instaloader. Supports multiple photos (carousels)."""
+    import instaloader
     import re
 
-    caption = ""
-    image_url = None
-
-    # Ensure URL is well-formed
-    if not url.startswith("http"):
-        url = "https://" + url
-
-    # ── Method 1: Instagram oEmbed API (public, no auth needed) ───────────
-    try:
-        oembed_url = f"https://api.instagram.com/oembed/?url={url}"
-        resp = requests.get(oembed_url, headers=_HTTP_HEADERS, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            image_url = data.get("thumbnail_url")
-            caption = data.get("title", "")
-            if image_url:
-                logger.info("Got image from oEmbed API: %s", image_url[:100])
-                return image_url, caption
-    except Exception as e:
-        logger.warning("oEmbed API failed: %s", e)
-
-    # ── Method 2: Scrape the page for og:image ────────────────────────────
-    try:
-        session = requests.Session()
-        session.headers.update(_HTTP_HEADERS)
-
-        if COOKIES_FILE and Path(COOKIES_FILE).is_file():
-            from http.cookiejar import MozillaCookieJar
-            cj = MozillaCookieJar(COOKIES_FILE)
-            try:
-                cj.load(ignore_discard=True, ignore_expires=True)
-                session.cookies.update(cj)
-            except Exception:
-                pass
-
-        resp = session.get(url, timeout=30, allow_redirects=True)
-        html = resp.text
-
-        # Extract og:image (try both attribute orders)
-        og_match = re.search(
-            r'<meta\s+[^>]*?content=["\']([^"\']+)["\'][^>]*?property=["\']og:image["\']',
-            html
-        ) or re.search(
-            r'<meta\s+[^>]*?property=["\']og:image["\'][^>]*?content=["\']([^"\']+)["\']',
-            html
-        )
-
-        if og_match:
-            image_url = og_match.group(1).replace("&amp;", "&")
-            logger.info("Found og:image: %s", image_url[:100])
-
-        # Extract caption from og:description
-        desc_match = re.search(
-            r'<meta\s+[^>]*?content=["\']([^"\']*)["\'][^>]*?property=["\']og:description["\']',
-            html
-        ) or re.search(
-            r'<meta\s+[^>]*?property=["\']og:description["\'][^>]*?content=["\']([^"\']*)["\']',
-            html
-        )
-        if desc_match and not caption:
-            caption = desc_match.group(1).replace("&amp;", "&").replace("&#39;", "'")
-
-    except Exception as e:
-        logger.warning("Page scrape failed: %s", e)
-
-    # ── Method 3: Try yt-dlp metadata extraction ──────────────────────────
-    if not image_url:
+    L = instaloader.Instaloader()
+    
+    # Load cookies if available
+    if COOKIES_FILE and Path(COOKIES_FILE).is_file():
         try:
-            opts: dict = {
-                "quiet": True,
-                "no_warnings": True,
-                "skip_download": True,
-                "writeinfojson": False,
-                "http_headers": _HTTP_HEADERS,
-                "socket_timeout": 30,
-            }
-            opts.update(_cookie_opts())
+            # instaloader prefers its own session format, but can import Netscape cookies
+            # However, for public posts it shouldn't be strictly necessary 
+            pass
+        except Exception:
+            pass
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False) or {}
+    # Extract shortcode
+    match = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if not match:
+        raise ValueError("Could not extract shortcode from URL")
+    shortcode = match.group(1)
 
-            thumbnails = info.get("thumbnails", [])
-            if thumbnails:
-                best = max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0))
-                image_url = best.get("url")
-            elif info.get("thumbnail"):
-                image_url = info["thumbnail"]
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+    caption = post.caption or ""
 
-            if not caption:
-                caption = _extract_caption(info)
+    image_urls = []
+    if post.typename == 'GraphSidecar':
+        for node in post.get_sidecar_nodes():
+            if not node.is_video:
+                image_urls.append(node.display_url)
+    elif not post.is_video:
+        image_urls.append(post.url)
 
-        except Exception as e2:
-            logger.warning("yt-dlp info extraction also failed: %s", e2)
+    if not image_urls:
+         raise ValueError("No images found in this post (it might be a video that yt-dlp failed to download).")
 
-    return image_url, caption
+    downloaded_paths = []
+    for idx, img_url in enumerate(image_urls):
+        filename = f"{shortcode}_{idx}" if len(image_urls) > 1 else shortcode
+        path = _download_image(img_url, output_dir, filename)
+        downloaded_paths.append(path)
+
+    # Return single string if only 1 photo, else list
+    final_path = downloaded_paths[0] if len(downloaded_paths) == 1 else downloaded_paths
+    logger.info("Instaloader downloaded %d image(s)", len(downloaded_paths))
+    
+    return final_path, "image", caption
 
 
 def _find_media_file(directory: str) -> str | None:

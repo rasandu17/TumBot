@@ -43,7 +43,7 @@ def _client() -> pytumblr.TumblrRestClient:
 
 
 def upload_to_tumblr(
-    media_path: str,
+    media_path: str | list[str],
     media_type: str,
     caption: str,
     source_url: str,
@@ -53,7 +53,7 @@ def upload_to_tumblr(
 
     Parameters
     ----------
-    media_path  : local path to the downloaded file
+    media_path  : local path(s) to the downloaded file(s)
     media_type  : "video" or "image"
     caption     : Instagram post description used as the Tumblr caption
     source_url  : original Instagram URL
@@ -64,6 +64,8 @@ def upload_to_tumblr(
     logger.info("Posting with tags: %s", DEFAULT_TAGS)
 
     if media_type == "video":
+        if isinstance(media_path, list):
+            media_path = media_path[0]
         response = client.create_video(
             TUMBLR_BLOG_NAME,
             caption=full_caption,
@@ -71,10 +73,12 @@ def upload_to_tumblr(
             tags=DEFAULT_TAGS,
         )
     else:
+        # Photos can be a single path or a list of paths
+        data_paths = media_path if isinstance(media_path, list) else [media_path]
         response = client.create_photo(
             TUMBLR_BLOG_NAME,
             caption=full_caption,
-            data=[media_path],
+            data=data_paths,
             tags=DEFAULT_TAGS,
         )
 

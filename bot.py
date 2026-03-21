@@ -113,7 +113,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
             from telegram import InputMediaPhoto
             await status_msg.edit_text("🖼️ Sending photo previews, please wait...")
-            
+            preview_message_ids = []
             try:
                 # Telegram allows max 10 photos per media group
                 m_list = list(media_path)
@@ -126,10 +126,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         with open(str(p), 'rb') as f:
                             # Read file fully to memory to avoid open file handles blocking deletion
                             media_group.append(InputMediaPhoto(f.read(), caption=f"Photo {num}"))
-                    await update.message.reply_media_group(media=media_group)
+                    msgs = await update.message.reply_media_group(media=media_group)
+                    preview_message_ids.extend([m.message_id for m in msgs])
                     offset += len(batch)
             except Exception as tg_err:
                 logger.warning("Could not send media group preview: %s", tg_err)
+                
+            pending_uploads[upload_id]["preview_message_ids"] = preview_message_ids
 
             keyboard = []
             row = []
@@ -193,6 +196,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
     session = pending_uploads[upload_id]
     
+    # ── Clean up previews immediately to clear the chat ──
+    for msg_id in session.get("preview_message_ids", []):
+        try:
+            if query.message:
+                await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_id)
+        except Exception as e:
+            logger.warning("Failed to delete preview message %s: %s", msg_id, e)
+            
     await query.edit_message_text("✅ Processing selection! Uploading to Tumblr… 📤")
     
     try:

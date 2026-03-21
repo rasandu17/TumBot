@@ -123,24 +123,27 @@ def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
         media_type = "video" if ext in {".mp4", ".mkv", ".webm", ".mov", ".avi"} else "image"
         caption = _extract_caption(info)
 
-    except yt_dlp.utils.DownloadError as e:
-        if "No video formats found" not in str(e):
+    except (yt_dlp.utils.DownloadError, FileNotFoundError) as e:
+        if isinstance(e, yt_dlp.utils.DownloadError) and "No video formats found" not in str(e):
             raise  # Re-raise if it's a different error
 
         # ── Photo post fallback ────────────────────────────────────────────
         logger.info("No video found — trying photo download for: %s", url)
-        info = _extract_info_only(url)
-        caption = _extract_caption(info)
 
-        # Get the best thumbnail/image URL from the info dict
-        image_url = _get_best_image_url(info)
+        # Try multiple methods to get the image URL
+        image_url, caption = _scrape_instagram_image(url)
+
         if not image_url:
             raise FileNotFoundError(
-                "Could not find an image URL for this post. "
-                "Make sure the post is public."
+                "Could not download this photo post. "
+                "Make sure the post is public and the URL is correct."
             ) from e
 
-        post_id = info.get("id", "photo")
+        # Extract post ID from URL
+        import re
+        match = re.search(r"/(p|reel|tv)/([A-Za-z0-9_-]+)", url)
+        post_id = match.group(2) if match else "photo"
+
         media_path = _download_image(image_url, output_dir, post_id)
         media_type = "image"
 
@@ -148,44 +151,102 @@ def download_instagram(url: str, output_dir: str) -> tuple[str, str, str]:
     return media_path, media_type, caption
 
 
-def _extract_info_only(url: str) -> dict:
-    """Extract metadata without downloading (for photo fallback)."""
-    opts: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "writeinfojson": False,
-        "http_headers": _HTTP_HEADERS,
-        "socket_timeout": 60,
-        "extract_flat": False,
-    }
-    opts.update(_cookie_opts())
+def _scrape_instagram_image(url: str) -> tuple[str | None, str]:
+    """
+    Scrape an Instagram post page to extract the image URL and caption.
+    Uses og:image meta tag which works for public posts.
+    Returns (image_url, caption) or (None, "") on failure.
+    """
+    import re
 
+    caption = ""
+    image_url = None
+
+    # Ensure URL is well-formed
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    # ── Method 1: Scrape the page for og:image ────────────────────────────
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False) or {}
-    except Exception:
-        return {}
+        # Try with cookies if available
+        session = requests.Session()
+        session.headers.update(_HTTP_HEADERS)
 
+        if COOKIES_FILE and Path(COOKIES_FILE).is_file():
+            # Load Netscape cookies into the session
+            from http.cookiejar import MozillaCookieJar
+            cj = MozillaCookieJar(COOKIES_FILE)
+            try:
+                cj.load(ignore_discard=True, ignore_expires=True)
+                session.cookies.update(cj)
+            except Exception as cookie_err:
+                logger.warning("Could not load cookies: %s", cookie_err)
 
-def _get_best_image_url(info: dict) -> str | None:
-    """Extract the best image URL from yt-dlp info dict."""
-    if not info:
-        return None
+        resp = session.get(url, timeout=30, allow_redirects=True)
+        html = resp.text
 
-    # Check thumbnails list (usually has the full-res image)
-    thumbnails = info.get("thumbnails", [])
-    if thumbnails:
-        # Sort by resolution (prefer largest)
-        best = max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0))
-        if best.get("url"):
-            return best["url"]
+        # Extract og:image
+        og_match = re.search(
+            r'<meta\s+(?:property|name)=["\']og:image["\']\s+content=["\']([^"\']+)["\']',
+            html
+        )
+        if not og_match:
+            og_match = re.search(
+                r'content=["\']([^"\']+)["\']\s+(?:property|name)=["\']og:image["\']',
+                html
+            )
 
-    # Fallback: direct thumbnail field
-    if info.get("thumbnail"):
-        return info["thumbnail"]
+        if og_match:
+            image_url = og_match.group(1).replace("&amp;", "&")
+            logger.info("Found og:image: %s", image_url[:100])
 
-    return None
+        # Extract og:description for caption
+        desc_match = re.search(
+            r'<meta\s+(?:property|name)=["\']og:description["\']\s+content=["\']([^"\']*)["\']',
+            html
+        )
+        if not desc_match:
+            desc_match = re.search(
+                r'content=["\']([^"\']*)["\']\\s+(?:property|name)=["\']og:description["\']',
+                html
+            )
+        if desc_match:
+            caption = desc_match.group(1).replace("&amp;", "&").replace("&#39;", "'")
+
+    except Exception as e:
+        logger.warning("Page scrape failed: %s", e)
+
+    # ── Method 2: Try yt-dlp metadata extraction as fallback ──────────────
+    if not image_url:
+        try:
+            opts: dict = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "writeinfojson": False,
+                "http_headers": _HTTP_HEADERS,
+                "socket_timeout": 30,
+            }
+            opts.update(_cookie_opts())
+
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False) or {}
+
+            # Check thumbnails
+            thumbnails = info.get("thumbnails", [])
+            if thumbnails:
+                best = max(thumbnails, key=lambda t: t.get("width", 0) * t.get("height", 0))
+                image_url = best.get("url")
+            elif info.get("thumbnail"):
+                image_url = info["thumbnail"]
+
+            if not caption:
+                caption = _extract_caption(info)
+
+        except Exception as e2:
+            logger.warning("yt-dlp info extraction also failed: %s", e2)
+
+    return image_url, caption
 
 
 def _find_media_file(directory: str) -> str | None:

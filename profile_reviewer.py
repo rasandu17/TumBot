@@ -80,11 +80,20 @@ def _get_user_id(session: requests.Session, username: str) -> str:
     # Method 1: Extract from HTML (less likely to 429 on Heroku/Koyeb)
     html_url = f"https://www.instagram.com/{username}/"
     try:
-        html_resp = session.get(html_url, timeout=30)
+        # Avoid X-Requested-With for HTML requests, it gets flagged
+        html_headers = dict(session.headers)
+        html_headers.pop("X-Requested-With", None)
+        
+        html_resp = session.get(html_url, headers=html_headers, timeout=30)
         if html_resp.status_code == 200:
-            match = re.search(r'"profile_id":"(\d+)"', html_resp.text)
-            if match:
-                return match.group(1)
+            # Look for multiple variants of how IG stores user ID in the HTML
+            for pattern in [r'"profile_id":"(\d+)"', r'"profile_id":(\d+)', r'"user_id":"(\d+)"', r'profilePage_(\d+)']:
+                match = re.search(pattern, html_resp.text)
+                if match:
+                    return match.group(1)
+            logger.warning(f"HTML fetch returned 200 but no ID found for @{username}.")
+        else:
+            logger.warning(f"HTML fetch returned {html_resp.status_code} for @{username}.")
     except Exception as e:
         logger.warning(f"HTML fetch for @{username} failed: {e}")
 

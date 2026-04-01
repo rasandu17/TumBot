@@ -21,3 +21,20 @@ cookies.txt
 cookies_b64.txt
 instagram_cookies.txt
 split_cookies_for_koyeb.py
+
+# Test & extract files
+test_*.py
+extract_instagram_cookies.py
+check_tumblr.py
+save_chunks.py
+start.py
+test_j.json
+*.txt
+!requirements.txt
+!README.md
+!Procfile
+
+# Misc
+chunks/
+test_galdl/
+test_galdl2/

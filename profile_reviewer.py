@@ -97,8 +97,8 @@ def _get_user_id(session: requests.Session, username: str) -> str:
     except Exception as e:
         logger.warning(f"HTML fetch for @{username} failed: {e}")
 
-    # Method 2: web_profile_info API
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    # Method 2: web_profile_info API (using i.instagram.com to bypass IP blocks)
+    url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
     resp = session.get(url, timeout=30)
 
     if resp.status_code == 200:
@@ -128,7 +128,7 @@ def _fetch_feed_page(
         params["max_id"] = max_id
 
     resp = session.get(
-        f"https://www.instagram.com/api/v1/feed/user/{user_id}/",
+        f"https://i.instagram.com/api/v1/feed/user/{user_id}/",
         params=params,
         timeout=30,
     )

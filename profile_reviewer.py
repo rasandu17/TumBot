@@ -76,21 +76,35 @@ def _make_session() -> requests.Session:
 
 
 def _get_user_id(session: requests.Session, username: str) -> str:
-    """Get the numeric user ID for a username via Instagram web API."""
+    """Get the numeric user ID for a username via Instagram web API or HTML fallback."""
+    # Method 1: Extract from HTML (less likely to 429 on Heroku/Koyeb)
+    html_url = f"https://www.instagram.com/{username}/"
+    try:
+        html_resp = session.get(html_url, timeout=30)
+        if html_resp.status_code == 200:
+            match = re.search(r'"profile_id":"(\d+)"', html_resp.text)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        logger.warning(f"HTML fetch for @{username} failed: {e}")
+
+    # Method 2: web_profile_info API
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     resp = session.get(url, timeout=30)
+
+    if resp.status_code == 200:
+        data = resp.json()
+        user = data.get("data", {}).get("user")
+        if user:
+            return str(user["id"])
 
     if resp.status_code == 401:
         raise RuntimeError("Instagram requires login. Make sure cookies.txt is valid.")
     if resp.status_code == 404:
         raise RuntimeError(f"Profile @{username} not found.")
+        
     resp.raise_for_status()
-
-    data = resp.json()
-    user = data.get("data", {}).get("user")
-    if not user:
-        raise RuntimeError(f"Could not get user info for @{username}. Profile may be private.")
-    return str(user["id"])
+    raise RuntimeError(f"Could not get user info for @{username}. Server returned {resp.status_code}.")
 
 
 def _fetch_feed_page(
